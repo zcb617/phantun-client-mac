@@ -1,0 +1,4 @@
+/target/
+/dist/
+*.dSYM/
+.DS_Store

@@ -1,0 +1,26 @@
+[package]
+name = "phantun-client-mac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "macOS implementation of the Phantun Windows client functional contract"
+
+[[bin]]
+name = "phantun-client"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+clap = { version = "4", features = ["cargo"] }
+fake-tcp = { path = "../fake-tcp" }
+libc = "0.2"
+log = { workspace = true }
+num_cpus = "1"
+pretty_env_logger = "0"
+pnet_packet = "0"
+serde = { workspace = true }
+serde_json = "1"
+socket2 = { version = "0", features = ["all"] }
+tokio = { workspace = true }
+tokio-util = "0"

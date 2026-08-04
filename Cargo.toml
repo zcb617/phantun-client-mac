@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "fake-tcp",
+    "phantun-client-mac",
+]
+
+[workspace.package]
+version = "0.8.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+log = "0"
+serde = { version = "1", features = ["derive"] }
