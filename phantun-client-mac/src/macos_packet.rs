@@ -10,11 +10,12 @@ use std::mem::{size_of, zeroed};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 
 const BPF_BUFFER_REQUESTED: u32 = 0x0008_0000;
+const BPF_POLL_TIMEOUT_MILLIS: libc::c_int = 250;
 const BPF_DLT_NULL: i32 = 0;
 const BPF_DLT_EN10MB: i32 = 1;
 const BPF_DLT_RAW: i32 = 12;
@@ -107,10 +108,16 @@ pub struct MacPacketDevice {
 
 impl MacPacketDevice {
     pub fn new(remote_addr: SocketAddr, local_ipv6: Option<SocketAddrV6>) -> io::Result<Self> {
-        let interface_name = route_interface(remote_addr.ip())?;
-        let capture = BpfCapture::open(&interface_name, remote_addr)?;
-        let sender = RawPacketSender::new(remote_addr, local_ipv6)?;
-        let firewall = FirewallGuard::install(remote_addr)?;
+        let interface_name = route_interface(remote_addr.ip()).map_err(|error_value| {
+            contextual_error("resolve the outbound interface", error_value)
+        })?;
+        let capture = BpfCapture::open(&interface_name, remote_addr)
+            .map_err(|error_value| contextual_error("open the macOS BPF capture", error_value))?;
+        let sender = RawPacketSender::new(remote_addr, local_ipv6)
+            .map_err(|error_value| contextual_error("open the raw TCP sender", error_value))?;
+        let firewall = FirewallGuard::install(remote_addr).map_err(|error_value| {
+            contextual_error("install the temporary PF rule", error_value)
+        })?;
 
         Ok(Self {
             capture,
@@ -119,6 +126,10 @@ impl MacPacketDevice {
             interface_name: format!("BPF/{interface_name}"),
         })
     }
+}
+
+fn contextual_error(context: &str, error_value: io::Error) -> io::Error {
+    io::Error::new(error_value.kind(), format!("{context}: {error_value}"))
 }
 
 #[async_trait]
@@ -141,7 +152,7 @@ impl TunDevice for MacPacketDevice {
 }
 
 struct BpfCapture {
-    fd: AsyncFd<OwnedFd>,
+    fd: Arc<OwnedFd>,
     buffer_len: usize,
     link_type: LinkType,
     remote_addr: SocketAddr,
@@ -150,8 +161,10 @@ struct BpfCapture {
 
 impl BpfCapture {
     fn open(interface_name: &str, remote_addr: SocketAddr) -> io::Result<Self> {
-        let fd = open_bpf_device()?;
+        let fd = open_bpf_device()
+            .map_err(|error_value| contextual_error("open /dev/bpf", error_value))?;
         configure_bpf(fd, interface_name, remote_addr)
+            .map_err(|error_value| contextual_error("configure /dev/bpf", error_value))
     }
 
     async fn read_packet(&self, output: &mut [u8]) -> io::Result<usize> {
@@ -160,41 +173,24 @@ impl BpfCapture {
                 return Ok(size);
             }
 
-            let mut readiness = self.fd.readable().await?;
-            let result = readiness.try_io(|inner| {
-                let mut records = vec![0_u8; self.buffer_len];
-                let size = unsafe {
-                    libc::read(
-                        inner.get_ref().as_raw_fd(),
-                        records.as_mut_ptr().cast(),
-                        records.len(),
-                    )
-                };
-                if size < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if size == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "macOS BPF device closed",
-                    ));
-                }
-                records.truncate(size as usize);
-                Ok(records)
-            });
+            let fd = Arc::clone(&self.fd);
+            let buffer_len = self.buffer_len;
+            let records =
+                tokio::task::spawn_blocking(move || read_bpf_records(fd.as_ref(), buffer_len))
+                    .await
+                    .map_err(|error_value| {
+                        io::Error::other(format!("macOS BPF reader task failed: {error_value}"))
+                    })??;
 
-            match result {
-                Ok(Ok(records)) => {
-                    let packets = Self::decode_records(&records, self.link_type, self.remote_addr)?;
-                    if !packets.is_empty() {
-                        self.pending
-                            .lock()
-                            .map_err(|_| io::Error::other("macOS BPF queue lock poisoned"))?
-                            .extend(packets);
-                    }
-                }
-                Ok(Err(error_value)) => return Err(error_value),
-                Err(_) => continue,
+            let Some(records) = records else {
+                continue;
+            };
+            let packets = Self::decode_records(&records, self.link_type, self.remote_addr)?;
+            if !packets.is_empty() {
+                self.pending
+                    .lock()
+                    .map_err(|_| io::Error::other("macOS BPF queue lock poisoned"))?
+                    .extend(packets);
             }
         }
     }
@@ -323,7 +319,8 @@ fn configure_bpf(
     }
 
     let mut buffer_len = BPF_BUFFER_REQUESTED;
-    ioctl_with_mut(&fd, libc::BIOCSBLEN, &mut buffer_len)?;
+    ioctl_with_mut(&fd, libc::BIOCSBLEN, &mut buffer_len)
+        .map_err(|error_value| contextual_error("BIOCSBLEN", error_value))?;
 
     let mut interface: libc::ifreq = unsafe { zeroed() };
     for (slot, byte) in interface
@@ -333,23 +330,29 @@ fn configure_bpf(
     {
         *slot = byte as libc::c_char;
     }
-    ioctl_with_mut(&fd, libc::BIOCSETIF, &mut interface)?;
+    ioctl_with_mut(&fd, libc::BIOCSETIF, &mut interface)
+        .map_err(|error_value| contextual_error("BIOCSETIF", error_value))?;
 
     let mut immediate: libc::c_uint = 1;
-    ioctl_with_mut(&fd, libc::BIOCIMMEDIATE, &mut immediate)?;
+    ioctl_with_mut(&fd, libc::BIOCIMMEDIATE, &mut immediate)
+        .map_err(|error_value| contextual_error("BIOCIMMEDIATE", error_value))?;
     // Keep locally generated frames visible as well. The BPF program already
     // selects only packets sourced by the configured Phantun server, which is
     // necessary when that server is reached through loopback.
     let mut see_sent: libc::c_uint = 1;
-    ioctl_with_mut(&fd, BIOCSSEESENT, &mut see_sent)?;
+    ioctl_with_mut(&fd, BIOCSSEESENT, &mut see_sent)
+        .map_err(|error_value| contextual_error("BIOCSSEESENT", error_value))?;
 
     let mut dlt: libc::c_uint = 0;
-    ioctl_with_mut(&fd, libc::BIOCGDLT, &mut dlt)?;
+    ioctl_with_mut(&fd, libc::BIOCGDLT, &mut dlt)
+        .map_err(|error_value| contextual_error("BIOCGDLT", error_value))?;
     let link_type = LinkType::from_dlt(dlt as i32)?;
-    install_bpf_filter(&fd, link_type, remote_addr)?;
+    install_bpf_filter(&fd, link_type, remote_addr)
+        .map_err(|error_value| contextual_error("install BPF filter", error_value))?;
 
     let mut actual_buffer_len: libc::c_uint = 0;
-    ioctl_with_mut(&fd, libc::BIOCGBLEN, &mut actual_buffer_len)?;
+    ioctl_with_mut(&fd, libc::BIOCGBLEN, &mut actual_buffer_len)
+        .map_err(|error_value| contextual_error("BIOCGBLEN", error_value))?;
     if actual_buffer_len == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -358,12 +361,66 @@ fn configure_bpf(
     }
 
     Ok(BpfCapture {
-        fd: AsyncFd::new(fd)?,
+        // Darwin's BPF character device does not support registration with
+        // kqueue on current macOS releases. Keep the descriptor nonblocking
+        // and poll it in the dedicated blocking pool instead.
+        fd: Arc::new(fd),
         buffer_len: actual_buffer_len as usize,
         link_type,
         remote_addr,
         pending: Mutex::new(VecDeque::new()),
     })
+}
+
+fn read_bpf_records(fd: &OwnedFd, buffer_len: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut poll_fd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = loop {
+        let value = unsafe { libc::poll(&mut poll_fd, 1, BPF_POLL_TIMEOUT_MILLIS) };
+        if value >= 0 {
+            break value;
+        }
+        let error_value = io::Error::last_os_error();
+        if error_value.kind() != io::ErrorKind::Interrupted {
+            return Err(error_value);
+        }
+    };
+    if ready == 0 {
+        return Ok(None);
+    }
+
+    let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+    if poll_fd.revents & error_events != 0 {
+        return Err(io::Error::other(format!(
+            "macOS BPF poll returned error events: 0x{:x}",
+            poll_fd.revents
+        )));
+    }
+    if poll_fd.revents & libc::POLLIN == 0 {
+        return Ok(None);
+    }
+
+    let mut records = vec![0_u8; buffer_len];
+    let size = unsafe { libc::read(fd.as_raw_fd(), records.as_mut_ptr().cast(), records.len()) };
+    if size < 0 {
+        let error_value = io::Error::last_os_error();
+        return if error_value.kind() == io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(error_value)
+        };
+    }
+    if size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "macOS BPF device closed",
+        ));
+    }
+    records.truncate(size as usize);
+    Ok(Some(records))
 }
 
 fn ioctl_with_mut<T>(fd: &OwnedFd, request: libc::c_ulong, value: &mut T) -> io::Result<()> {
@@ -534,7 +591,7 @@ impl RawPacketSender {
                 }
                 Ok(Self::Ipv4 {
                     fd: AsyncFd::new(fd)?,
-                    remote: sockaddr_v4(remote),
+                    remote: raw_destination_v4(remote),
                 })
             }
             SocketAddr::V6(remote) => {
@@ -563,7 +620,7 @@ impl RawPacketSender {
                 }
                 Ok(Self::Ipv6 {
                     fd: AsyncFd::new(fd)?,
-                    remote: sockaddr_v6(remote),
+                    remote: raw_destination_v6(remote),
                 })
             }
         }
@@ -627,7 +684,34 @@ fn send_ipv4_packet(raw_fd: RawFd, remote: &libc::sockaddr_in, packet: &[u8]) ->
             "IPv4 raw socket received a non-IPv4 fake-TCP packet",
         ));
     }
-    send_to(raw_fd, packet, remote, size_of::<libc::sockaddr_in>())
+    let packet = macos_raw_ipv4_packet(packet)?;
+    send_to(raw_fd, &packet, remote, size_of::<libc::sockaddr_in>())
+}
+
+fn macos_raw_ipv4_packet(packet: &[u8]) -> io::Result<Vec<u8>> {
+    if packet.len() < 20 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPv4 fake-TCP packet is shorter than its IP header",
+        ));
+    }
+    let header_len = (packet[0] as usize & 0x0f) * 4;
+    let total_len = u16::from_be_bytes(packet[2..4].try_into().expect("fixed length"));
+    if header_len < 20 || header_len > packet.len() || total_len as usize != packet.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPv4 fake-TCP packet has an invalid total length",
+        ));
+    }
+
+    let mut macos_packet = packet.to_vec();
+    // Darwin's IP_HDRINCL path reads ip_len and ip_off in host byte order
+    // before it serializes the header on output. fake-tcp creates a normal
+    // wire-format IPv4 packet, so convert those fields for the raw socket call.
+    macos_packet[2..4].copy_from_slice(&total_len.to_ne_bytes());
+    let fragment_offset = u16::from_be_bytes(packet[6..8].try_into().expect("fixed length"));
+    macos_packet[6..8].copy_from_slice(&fragment_offset.to_ne_bytes());
+    Ok(macos_packet)
 }
 
 fn send_ipv6_packet(
@@ -691,6 +775,15 @@ fn sockaddr_v4(address: SocketAddrV4) -> libc::sockaddr_in {
     }
 }
 
+fn raw_destination_v4(address: SocketAddrV4) -> libc::sockaddr_in {
+    let mut destination = sockaddr_v4(address);
+    // The TCP port is carried in the supplied IP packet. BSD raw-IP sockets
+    // require the sockaddr port to be zero; macOS rejects a nonzero value with
+    // EINVAL before transmitting the packet.
+    destination.sin_port = 0;
+    destination
+}
+
 fn sockaddr_v6(address: SocketAddrV6) -> libc::sockaddr_in6 {
     libc::sockaddr_in6 {
         sin6_len: size_of::<libc::sockaddr_in6>() as u8,
@@ -702,6 +795,13 @@ fn sockaddr_v6(address: SocketAddrV6) -> libc::sockaddr_in6 {
         },
         sin6_scope_id: address.scope_id(),
     }
+}
+
+fn raw_destination_v6(address: SocketAddrV6) -> libc::sockaddr_in6 {
+    let mut destination = sockaddr_v6(address);
+    // Like IPv4 raw-IP sockets, the TCP port belongs to the packet payload.
+    destination.sin6_port = 0;
+    destination
 }
 
 struct FirewallGuard {
@@ -1080,6 +1180,31 @@ mod tests {
             ipv6_tcp_payload(&packet).expect("valid IPv6 packet"),
             &packet[40..]
         );
+    }
+
+    #[test]
+    fn raw_ipv4_packet_uses_darwin_host_order_length() {
+        let packet = build_tcp_packet(
+            "192.0.2.10:40000".parse().expect("valid IPv4 address"),
+            remote(),
+            0,
+            0,
+            TcpFlags::SYN,
+            None,
+        );
+
+        let prepared = macos_raw_ipv4_packet(&packet).expect("valid IPv4 packet");
+
+        assert_eq!(
+            u16::from_ne_bytes(prepared[2..4].try_into().expect("fixed length")),
+            packet.len() as u16
+        );
+        assert_eq!(
+            u16::from_ne_bytes(prepared[6..8].try_into().expect("fixed length")),
+            u16::from_be_bytes(packet[6..8].try_into().expect("fixed length"))
+        );
+        assert_eq!(&prepared[4..6], &packet[4..6]);
+        assert_eq!(&prepared[8..], &packet[8..]);
     }
 
     #[test]
